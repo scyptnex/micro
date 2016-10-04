@@ -14,14 +14,22 @@ type FileTypeRules struct {
 	text     string
 }
 
+// Elements of the syntax parser, whether this is the start of an expression, the end, or the whole thing
+type SynElement int
+const (
+    startSynElement SynElement = iota
+    endSynElement
+    totalSynElement
+)
+
 // SyntaxRule represents a regex to highlight in a certain style
 type SyntaxRule struct {
 	// What to highlight
 	regex *regexp.Regexp
 	// Any flags
 	flags string
-	// Whether this regex is a start=... end=... regex
-	startend bool
+	// Whether this regex is a start=... end=... or just ...
+	element SynElement
 	// How to highlight it
 	style tcell.Style
 }
@@ -206,7 +214,7 @@ func LoadRulesFromFile(text, filename string) []SyntaxRule {
 			}
 			// Add the regex, flags, and style
 			// False because this is not start-end
-			rules = append(rules, SyntaxRule{regex, flags, false, st})
+			rules = append(rules, SyntaxRule{regex, flags, totalSynElement, st})
 		} else if ruleStartEndParser.MatchString(line) {
 			// Start-end syntax rule
 			submatch := ruleStartEndParser.FindSubmatch([]byte(line))
@@ -233,7 +241,12 @@ func LoadRulesFromFile(text, filename string) []SyntaxRule {
 			}
 
 			// Compile the regex
-			regex, err := regexp.Compile("(?" + flags + ")" + "(" + start + ").*?(" + end + ")")
+			regexStart, err := regexp.Compile("(?" + flags + ")" + "(" + start + ")")
+			if err != nil {
+				TermError(filename, lineNum, err.Error())
+				continue
+			}
+			regexEnd, err := regexp.Compile("(?" + flags + ")" + "(" + end + ")")
 			if err != nil {
 				TermError(filename, lineNum, err.Error())
 				continue
@@ -251,7 +264,8 @@ func LoadRulesFromFile(text, filename string) []SyntaxRule {
 			}
 			// Add the regex, flags, and style
 			// True because this is start-end
-			rules = append(rules, SyntaxRule{regex, flags, true, st})
+			rules = append(rules, SyntaxRule{regexStart, flags, startSynElement, st})
+			rules = append(rules, SyntaxRule{regexEnd,   flags, endSynElement,   st})
 		}
 	}
 	return rules
@@ -286,6 +300,51 @@ func GetRules(buf *Buffer) []SyntaxRule {
 // so map[3] represents the style of the third character
 type SyntaxMatches [][]tcell.Style
 
+
+// syntax highlight matching:
+// 2 kinds of matches, multiline and single line
+// - single line matches, only check within the view
+// - multiline, check ABOVE the viewport for starts
+// THE WORST CASE:
+// - multiline matches where the start is the same as the end, i.e. python super strings """.*"""
+// - the only good heuristic to tell if you're in a multiline is if there are "fewer single-line matches" where you are than outside you
+//   - too expensive, we'll just eagerly assume the viewport is NOT in a multiline unless we know otherwise
+//   - foreseeable issue: if you're looking at a long python docstring it will start highlighting the comment like it was python code (if anyone asks, this is a feature to support doctests :P)
+//
+// to disambiguate unique-starts and unique-ends are different multiline blocks, whereas a start-end is when they are the same
+//
+// practical solution, STATE TRANSITIONS:
+//
+// normal-mode.
+//   for each line, get every match for every regex, proceed left-to-right, where a match begins, skip to its end and highlight the region
+//    - if an entire match was skipped for a different regex, overwrite the highlights for the region you just matched with the sub-match (e.g. to handle escape-sequences within string literals "\t")
+//    - UNLESS that skip is a start/end of a multiline region
+//   when the end of a multiline region is matched:
+//    - if the match occurs OUTSIDE any other match, assume it is valid and overwrite all highlighting before it, proceed in normal-mode
+//    - if the match occurs INSIDE any other match, look backwards (above the window) for its start, which must occur OUTSIDE any single-line match
+//      - if found, highlight everything before the end marker and proceed in normal mode
+//      - if not found, the match is a red-herring, skip it
+//   when the start of a multiline region is matched:
+//      - if the match occurs INSIDE any other match, it must be invalid (based on the assumption that the window begins outside multiline comments)
+//      - if the match occurs OUTSIDE any other match, it must be valid, so eagerly highlight everything until you match its end or reach the end of the window
+//   when you run out of lines, go to cleanup mode
+// cleanup-mode.
+//   for every multiline-start with an end that was never matched within the window
+//    - search above for it
+//
+//
+//
+//
+//
+//
+// highlight strategy:
+// 1. do single-line syntaxes within the viewport eagerly
+// 2. if we find a unique-end OUTSIDE a syntax region, search above for its match.  If found, set everything between the match and the view-start as multiline block
+//    - caveat: somehow this multi-end is actually within a multiline block, then it and everything below it should be over-highlighted, CASE HANDLED IN TODO
+// 3. if we find a unique-start OUTSIDE a syntax region, search below for its match.  If no match is found BY THE END OF THE VIEWPORT, assume it exists far below and just highlight multiline until the end of the viewport
+//    - caveat: somehow this multi-start is actually within a multiline block, then it and everything before it should be over-highlighted, CASE HANDLED IN TODO
+// 4. if we find a
+
 // Match takes a buffer and returns the syntax matches: a 2d array specifying how it should be syntax highlighted
 // We match the rules from up `synLinesUp` lines and down `synLinesDown` lines
 func Match(v *View) SyntaxMatches {
@@ -318,46 +377,55 @@ func Match(v *View) SyntaxMatches {
 		totalEnd = buf.NumLines
 	}
 
-	str := strings.Join(buf.Lines(totalStart, totalEnd), "\n")
-	startNum := ToCharPos(Loc{0, totalStart}, v.Buf)
+	// str := strings.Join(buf.Lines(totalStart, totalEnd), "\n")
+	//startNum := ToCharPos(Loc{0, totalStart}, v.Buf)
 
-	for _, rule := range rules {
-		if rule.startend {
-			if indicies := rule.regex.FindAllStringIndex(str, -1); indicies != nil {
-				for _, value := range indicies {
-					value[0] = runePos(value[0], str) + startNum
-					value[1] = runePos(value[1], str) + startNum
-					startLoc := FromCharPos(value[0], buf)
-					endLoc := FromCharPos(value[1], buf)
-					for curLoc := startLoc; curLoc.LessThan(endLoc); curLoc = curLoc.Move(1, buf) {
-						if curLoc.Y < v.Topline {
-							continue
-						}
-						colNum, lineNum := curLoc.X, curLoc.Y
-						if lineNum == -1 || colNum == -1 {
-							continue
-						}
-						lineNum -= viewStart
-						if lineNum >= 0 && lineNum < v.height {
-							matches[lineNum][colNum] = rule.style
-						}
-					}
-				}
-			}
-		} else {
-			for lineN, line := range lines {
-				if indicies := rule.regex.FindAllStringIndex(line, -1); indicies != nil {
-					for _, value := range indicies {
-						start := runePos(value[0], line)
-						end := runePos(value[1], line)
-						for i := start; i < end; i++ {
-							matches[lineN][i] = rule.style
-						}
-					}
-				}
-			}
-		}
-	}
+    for lineN, line := range lines {
+        // find all the matching strings for this line
+        allMatches := make([][][]int, len(rules))
+        for ruleN,rule := range rules {
+            allMatches[ruleN] = rule.regex.FindAllStringIndex(line, -1)
+        }
+        // TODO
+    }
+
+	// for _, rule := range rules {
+	// 	if rule.startend {
+	// 		if indicies := rule.regex.FindAllStringIndex(str, -1); indicies != nil {
+	// 			for _, value := range indicies {
+	// 				value[0] = runePos(value[0], str) + startNum
+	// 				value[1] = runePos(value[1], str) + startNum
+	// 				startLoc := FromCharPos(value[0], buf)
+	// 				endLoc := FromCharPos(value[1], buf)
+	// 				for curLoc := startLoc; curLoc.LessThan(endLoc); curLoc = curLoc.Move(1, buf) {
+	// 					if curLoc.Y < v.Topline {
+	// 						continue
+	// 					}
+	// 					colNum, lineNum := curLoc.X, curLoc.Y
+	// 					if lineNum == -1 || colNum == -1 {
+	// 						continue
+	// 					}
+	// 					lineNum -= viewStart
+	// 					if lineNum >= 0 && lineNum < v.height {
+	// 						matches[lineNum][colNum] = rule.style
+	// 					}
+	// 				}
+	// 			}
+	// 		}
+	// 	} else {
+	// 		for lineN, line := range lines {
+	// 			if indicies := rule.regex.FindAllStringIndex(line, -1); indicies != nil {
+	// 				for _, value := range indicies {
+	// 					start := runePos(value[0], line)
+	// 					end := runePos(value[1], line)
+	// 					for i := start; i < end; i++ {
+	// 						matches[lineN][i] = rule.style
+	// 					}
+	// 				}
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 	return matches
 }
